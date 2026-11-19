@@ -1,0 +1,18 @@
+MAGOS - Etapa 1 (pygame)
+
+PyCharm: abre esta carpeta como proyecto -> pip install pygame (o requirements.txt) -> ejecuta main.py
+
+Controles: A/D o flechas mover | SHIFT correr | ESPACIO/W/ARRIBA saltar (mantener = mas alto)
+           J/Z/X lanzar magia | P/ESC pausa | ENTER confirmar
+           1 / 2 / 3 magias especiales (gastan MAGIA y tienen enfriamiento)
+
+Magias especiales (barra azul de MAGIA bajo los corazones; los cristales y derrotar enemigos la recargan):
+  1 Ola de Choque      coste 20   enfriamiento 4 s    cupulas de energia que avanzan por el suelo
+  2 Nova Arcana        coste 35   enfriamiento 8 s    explosion alrededor del mago, borra proyectiles
+  3 Tormenta de Rayos  coste 50   enfriamiento 14 s   5 rayos caen del cielo sobre los enemigos
+Valores ajustables en main.py: MANA_MAX, MANA_REGEN, MANA_CRISTAL y la lista ESPECIALES.
+
+Niveles (niveles.py): 1 Valle Brumoso, 2 Colinas Rojizas, 3 Bosque Nocturno, 4 Cascada Mistica,
+5 Pantano Embrujado, 6 Bosque de Telaranas, 7 Cementerio Espectral, 8 Cabana Embrujada (zonas Halloween).
+Enemigos: F mago de fuego, L mago de rayos (disparan) | G, H, I gorgonas (persiguen y atacan con la cola).
+Para comprobar que los niveles se pueden completar:  python niveles.py
