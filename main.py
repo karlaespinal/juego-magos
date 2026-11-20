@@ -1,5 +1,5 @@
 """
-Videojuego de plataformas con magos - Etapa 1 (4 niveles)
+Videojuego de plataformas con magos - Etapa 1 (8 niveles)
 
 Ejecutar en PyCharm:  abrir esta carpeta como proyecto y correr main.py
 Requiere:             pip install pygame
@@ -9,6 +9,7 @@ Controles
     SHIFT ............... correr
     ESPACIO / W / ARRIBA  saltar (mantener = salto mas alto)
     J / Z / X ........... lanzar magia
+    1 / 2 / 3 ........... magias especiales (gastan MAGIA y tienen enfriamiento)
     P / ESC ............. pausa
     ENTER ............... confirmar
 """
@@ -16,6 +17,7 @@ import os
 import sys
 import math
 import random
+import asyncio          # necesario para Pygbag (web)
 
 import pygame
 
@@ -27,10 +29,13 @@ from niveles import TILE, FILAS
 # ----------------------------------------------------------------------
 ANCHO, ALTO = 1280, 720
 FPS = 60
+WEB = sys.platform == "emscripten"      # True cuando corre en el navegador (Pygbag)
 BASE = os.path.dirname(os.path.abspath(__file__))
 RUTA_PERS = os.path.join(BASE, "Datos", "Assents", "Personajes")
 RUTA_FONDOS = os.path.join(BASE, "Datos", "Assents", "Fondos")
+RUTA_FX = os.path.join(BASE, "Datos", "Assents", "Efectos")
 
+N_FONDOS = 8            # fondo_1..4: zonas originales, fondo_5..8: zonas Halloween
 ESCALA = 1.6            # escala de los sprites (cada cuadro original mide 128x128)
 FRAME = 128
 ANCLA_X = 50            # x (en el cuadro original) donde está el centro del cuerpo del mago
@@ -42,6 +47,17 @@ VEL_CORRER = 400
 VEL_SALTO = 860
 VIDAS_INICIALES = 3
 VIDA_MAX = 5
+
+# --- Magia y habilidades especiales (teclas 1, 2 y 3)
+MANA_MAX = 100
+MANA_REGEN = 5.0         # magia que se recupera por segundo
+MANA_CRISTAL = 4         # magia que da cada cristal
+TIEMPO_HECHIZO = 0.5     # duración de la animación de lanzamiento
+ESPECIALES = [
+    dict(nombre="Ola de Choque", coste=20, cd=4.0),
+    dict(nombre="Nova Arcana", coste=35, cd=8.0),
+    dict(nombre="Tormenta de Rayos", coste=50, cd=14.0),
+]
 
 BLANCO = (255, 255, 255)
 NEGRO = (0, 0, 0)
@@ -57,7 +73,7 @@ def signo(v):
 class Hoja:
     """Animación cargada desde una hoja de sprites horizontal (cuadros de 128 px)."""
 
-    def __init__(self, ruta, fps):
+    def __init__(self, ruta, fps, ancla=ANCLA_X):
         img = pygame.image.load(ruta).convert_alpha()
         n = img.get_width() // FRAME
         w = int(FRAME * ESCALA)
@@ -73,7 +89,7 @@ class Hoja:
         self.fps = fps
         self.ancho = w
         self.alto = h
-        self.ancla_der = ANCLA_X * ESCALA
+        self.ancla_der = ancla * ESCALA
         self.ancla_izq = w - self.ancla_der
 
     def frame_ciclo(self, t):
@@ -90,9 +106,20 @@ class Hoja:
         pantalla.blit(img, (centro_x - ancla - cam_x, pies_y - self.alto))
 
 
-def cargar_personaje(carpeta, anims):
-    return {nombre: Hoja(os.path.join(RUTA_PERS, carpeta, archivo), fps)
+def cargar_personaje(carpeta, anims, ancla=ANCLA_X):
+    return {nombre: Hoja(os.path.join(RUTA_PERS, carpeta, archivo), fps, ancla)
             for nombre, (archivo, fps) in anims.items()}
+
+
+def cargar_efectos():
+    """Efectos de las magias especiales (explosiones y rayos)."""
+    def serie(prefijo, n, dos_digitos):
+        fmt = "{}_{:02d}.png" if dos_digitos else "{}_{}.png"
+        return [pygame.image.load(os.path.join(RUTA_FX, fmt.format(prefijo, i))).convert_alpha()
+                for i in range(1, n + 1)]
+    return dict(nova=serie("nova", 10, True), ola=serie("ola", 10, True),
+                rayo_a=serie("rayo_a", 5, False), rayo_b=serie("rayo_b", 6, False),
+                impacto=serie("impacto", 4, False))
 
 
 # ----------------------------------------------------------------------
@@ -275,6 +302,98 @@ class Proyectil:
 
 
 # ----------------------------------------------------------------------
+# Efectos de las magias especiales
+# ----------------------------------------------------------------------
+class FxOla:
+    """Magia 1 - Ola de Choque: cúpulas de energía que avanzan por el suelo."""
+
+    def __init__(self, fx, x, pies, retraso, golpeados):
+        self.frames = fx['ola']
+        self.x, self.pies = x, pies
+        self.t = -retraso
+        self.dur = 0.62
+        self.golpeados = golpeados      # compartido: 1 golpe por enemigo y lanzamiento
+        self.vivo = True
+
+    def update(self, dt, esc):
+        self.t += dt
+        if self.t >= self.dur:
+            self.vivo = False
+        elif 0.14 <= self.t <= 0.42:
+            esc.dano_area(pygame.Rect(int(self.x - 105), int(self.pies - 170), 210, 170), 2, self.golpeados)
+
+    def dibujar(self, pantalla, cam_x):
+        if self.t < 0 or not self.vivo:
+            return
+        img = self.frames[min(len(self.frames) - 1, int(self.t / self.dur * len(self.frames)))]
+        # la base de la cúpula está al ~77% de la altura del cuadro
+        pantalla.blit(img, (self.x - img.get_width() / 2 - cam_x, self.pies - img.get_height() * 0.776))
+
+
+class FxNova:
+    """Magia 2 - Nova Arcana: explosión alrededor del mago que daña y limpia proyectiles."""
+    RADIO = 205
+
+    def __init__(self, fx, cx, cy):
+        self.frames = fx['nova']
+        self.cx, self.cy = cx, cy
+        self.t = 0.0
+        self.dur = 0.75
+        self.golpeo = False
+        self.vivo = True
+
+    def update(self, dt, esc):
+        self.t += dt
+        if not self.golpeo and self.t >= 0.2:
+            self.golpeo = True
+            esc.dano_circulo(self.cx, self.cy, self.RADIO, 3)
+            esc.sacudida = 0.35
+            esc.particulas.explosion(self.cx, self.cy, (140, 210, 255), 30, 420, 0.8, 6)
+        if self.t >= self.dur:
+            self.vivo = False
+
+    def dibujar(self, pantalla, cam_x):
+        img = self.frames[min(len(self.frames) - 1, int(self.t / self.dur * len(self.frames)))]
+        pantalla.blit(img, (self.cx - img.get_width() / 2 - cam_x, self.cy - img.get_height() / 2))
+
+
+class FxRayo:
+    """Magia 3 - Tormenta de Rayos: cae un rayo del cielo sobre cada objetivo."""
+    FPS = 26
+
+    def __init__(self, fx, x, pies, retraso, golpeados):
+        self.golpeados = golpeados
+        self.x, self.pies = x, pies
+        alto = max(140, int(pies))
+        self.frames = [pygame.transform.scale(f, (120, alto)) for f in fx['rayo_a'] + fx['rayo_b']]
+        self.impacto = [pygame.transform.scale(f, (130, 130)) for f in fx['impacto']]
+        self.t = -retraso
+        self.golpeo = False
+        self.vivo = True
+
+    def update(self, dt, esc):
+        self.t += dt
+        idx = int(self.t * self.FPS)
+        if self.t >= 0 and not self.golpeo and idx >= 6:
+            self.golpeo = True
+            esc.dano_area(pygame.Rect(int(self.x - 65), 0, 130, int(self.pies) + 12), 4, self.golpeados)
+            esc.sacudida = max(esc.sacudida, 0.2)
+            esc.particulas.explosion(self.x, self.pies - 10, (190, 230, 255), 16, 320, 0.6, 5)
+        if idx >= len(self.frames) + 6:
+            self.vivo = False
+
+    def dibujar(self, pantalla, cam_x):
+        if self.t < 0 or not self.vivo:
+            return
+        idx = int(self.t * self.FPS)
+        if idx < len(self.frames):
+            pantalla.blit(self.frames[idx], (self.x - 60 - cam_x, 0))
+        if idx >= 5:
+            im = self.impacto[min(len(self.impacto) - 1, (idx - 5) // 2)]
+            pantalla.blit(im, (self.x - im.get_width() / 2 - cam_x, self.pies - im.get_height() * 0.75))
+
+
+# ----------------------------------------------------------------------
 # Jugador
 # ----------------------------------------------------------------------
 class Jugador(Cuerpo):
@@ -297,6 +416,15 @@ class Jugador(Cuerpo):
         self.t_muerte = 0.0
         self.corriendo = False
         self._contada = False    # la vida perdida ya se descontó
+        # magia y habilidades especiales
+        self.mana = float(MANA_MAX)
+        self.mana_vis = float(MANA_MAX)      # valor mostrado: baja de forma progresiva
+        self.cd_esp = [0.0] * len(ESPECIALES)
+        self.t_hechizo = 0.0
+        self.hechizo_pend = -1.0
+        self.hechizo_idx = -1
+        self.especial_listo = None           # índice de la magia que debe aparecer ahora
+        self.sin_mana = 0.0                  # parpadeo de aviso "magia insuficiente"
 
     def colocar(self, cx, pies_y):
         self.x = cx - self.w / 2
@@ -309,6 +437,11 @@ class Jugador(Cuerpo):
         self.t_ataque = 0
         self.disparo_pend = -1
         self.t_muerte = 0
+        self.t_hechizo = 0
+        self.hechizo_pend = -1
+        self.especial_listo = None
+        self.mana = max(self.mana, MANA_MAX * 0.5)
+        self.mana_vis = self.mana
 
     # --- entrada
     def pulsar_salto(self):
@@ -318,8 +451,29 @@ class Jugador(Cuerpo):
         if self.vy < -250:
             self.vy *= 0.5
 
+    def dar_mana(self, n):
+        self.mana = min(float(MANA_MAX), self.mana + n)
+
+    def lanzar_especial(self, i):
+        """Teclas 1, 2, 3. Gasta magia y activa el enfriamiento de esa habilidad."""
+        if not self.vivo or self.herido > 0 or self.t_hechizo > 0:
+            return
+        esp = ESPECIALES[i]
+        if self.cd_esp[i] > 0:
+            return
+        if self.mana < esp['coste']:
+            self.sin_mana = 0.5
+            return
+        self.mana -= esp['coste']
+        self.cd_esp[i] = esp['cd']
+        self.t_hechizo = TIEMPO_HECHIZO
+        self.hechizo_pend = TIEMPO_HECHIZO * 0.45
+        self.hechizo_idx = i
+        self.t_ataque = 0
+        self.disparo_pend = -1
+
     def lanzar(self):
-        if self.vivo and self.cd_disparo <= 0 and self.herido <= 0:
+        if self.vivo and self.cd_disparo <= 0 and self.herido <= 0 and self.t_hechizo <= 0:
             self.cd_disparo = 0.38
             self.t_ataque = 0.35
             self.disparo_pend = 0.14
@@ -339,6 +493,8 @@ class Jugador(Cuerpo):
         self.herido = 0.3
         self.t_ataque = 0
         self.disparo_pend = -1
+        self.t_hechizo = 0
+        self.hechizo_pend = -1
         self.vx = -signo(origen_x - self.cx) * 260 or 260
         self.vy = -380
         return True
@@ -349,6 +505,16 @@ class Jugador(Cuerpo):
         self.cd_disparo = max(0, self.cd_disparo - dt)
         self.t_ataque = max(0, self.t_ataque - dt)
         self.buffer_salto = max(0, self.buffer_salto - dt)
+        self.t_hechizo = max(0, self.t_hechizo - dt)
+        self.sin_mana = max(0, self.sin_mana - dt)
+        self.cd_esp = [max(0.0, c - dt) for c in self.cd_esp]
+        if self.vivo:
+            self.mana = min(float(MANA_MAX), self.mana + MANA_REGEN * dt)
+        # la barra mostrada se vacía poco a poco y se llena al instante
+        if self.mana_vis > self.mana:
+            self.mana_vis = max(self.mana, self.mana_vis - 70 * dt)
+        else:
+            self.mana_vis = self.mana
 
         if not self.vivo:
             self.t_muerte += dt
@@ -381,6 +547,13 @@ class Jugador(Cuerpo):
             self.buffer_salto = 0
             self.suelo = False
 
+        # magia especial diferida (sincronizada con la animación de lanzamiento)
+        if self.hechizo_pend >= 0:
+            self.hechizo_pend -= dt
+            if self.hechizo_pend < 0:
+                self.especial_listo = self.hechizo_idx
+                self.hechizo_pend = -1
+
         # disparo diferido (sincronizado con la animación)
         if self.disparo_pend >= 0:
             self.disparo_pend -= dt
@@ -400,6 +573,9 @@ class Jugador(Cuerpo):
         elif self.herido > 0:
             h = a['hurt']
             idx = h.frame_progreso(1 - self.herido / 0.3)
+        elif self.t_hechizo > 0:
+            h = a['cast']
+            idx = h.frame_progreso(1 - self.t_hechizo / TIEMPO_HECHIZO)
         elif self.t_ataque > 0:
             h = a['attack']
             idx = h.frame_progreso(1 - self.t_ataque / 0.35)
@@ -423,11 +599,25 @@ class Jugador(Cuerpo):
 # ----------------------------------------------------------------------
 # Enemigos
 # ----------------------------------------------------------------------
+ANIMS_MAGO = {
+    'idle': ("Idle.png", 8), 'walk': ("Walk.png", 9), 'attack': ("Attack_1.png", 10),
+    'hurt': ("Hurt.png", 10), 'dead': ("Dead.png", 8)}
+ANIMS_GORGONA = {
+    'idle': ("Idle.png", 8), 'walk': ("Walk.png", 14), 'attack': ("Attack_2.png", 10),
+    'hurt': ("Hurt.png", 8), 'dead': ("Dead.png", 5)}
+
+# F, L: magos que disparan.  G, H, I: gorgonas que persiguen y atacan con la cola (cuerpo a cuerpo)
 TIPOS_ENEMIGO = {
-    'F': dict(carpeta="Fire Wizard", color=(255, 150, 40), vel_proy=360, cd=2.0, dur=0.7,
-              puntos=250, rango=520),
-    'L': dict(carpeta="Lightning Mage", color=(120, 220, 255), vel_proy=500, cd=1.6, dur=0.8,
-              puntos=250, rango=560),
+    'F': dict(carpeta="Fire_Wizard", color=(255, 150, 40), vel_proy=360, cd=2.0, dur=0.7,
+              puntos=250, rango=520, anims=ANIMS_MAGO),
+    'L': dict(carpeta="Lightning_Mage", color=(120, 220, 255), vel_proy=500, cd=1.6, dur=0.8,
+              puntos=250, rango=560, anims=ANIMS_MAGO),
+    'G': dict(carpeta="Gorgon_1", color=(150, 210, 70), melee=True, vel=60, vel_persecucion=120,
+              cd=1.3, dur=0.7, puntos=300, rango=380, hp_extra=0, ancla=56, anims=ANIMS_GORGONA),
+    'H': dict(carpeta="Gorgon_2", color=(170, 120, 210), melee=True, vel=60, vel_persecucion=140,
+              cd=1.2, dur=0.7, puntos=350, rango=400, hp_extra=1, ancla=62, anims=ANIMS_GORGONA),
+    'I': dict(carpeta="Gorgon_3", color=(240, 210, 120), melee=True, vel=70, vel_persecucion=170,
+              cd=1.1, dur=0.85, puntos=450, rango=420, hp_extra=2, ancla=58, anims=ANIMS_GORGONA),
 }
 
 
@@ -448,6 +638,7 @@ class Enemigo(Cuerpo):
         self.disparado = False
         self.t_muerto = 0.0
         self.eliminar = False
+        self.golpe = False        # las gorgonas lo activan al acertar con la cola
 
     def recibir_dano(self, n, particulas):
         if self.estado == 'muerto':
@@ -544,6 +735,78 @@ class Enemigo(Cuerpo):
         h.dibujar(pantalla, idx, self.cx, self.pies, self.dir, cam_x)
 
 
+class Gorgona(Enemigo):
+    """Enemigo cuerpo a cuerpo: patrulla, persigue al jugador y ataca con la cola."""
+
+    def __init__(self, tipo, col, fila, anims, hp):
+        super().__init__(tipo, col, fila, anims, hp)
+        self.w, self.h = 44, 104
+        self.x = (col + 0.5) * TILE - self.w / 2
+        self.y = (fila + 1) * TILE - self.h
+
+    def _obstaculo(self, mundo):
+        frente = int(self.cx + self.dir * (self.w / 2 + 4)) // TILE
+        fila_pies = int(self.pies + 2) // TILE
+        fila_medio = int(self.y + self.h / 2) // TILE
+        return mundo.solido(frente, fila_medio) or not mundo.solido(frente, fila_pies)
+
+    def alcance(self):
+        x = self.cx if self.dir > 0 else self.cx - 125
+        return pygame.Rect(int(x), int(self.y + 20), 125, self.h - 20)
+
+    def update(self, dt, mundo, jugador, proyectiles):
+        self.t_anim += dt
+        if self.estado == 'muerto':
+            self.t_estado += dt
+            self.vx = 0
+            self.vy = min(VEL_CAIDA_MAX, self.vy + GRAVEDAD * dt)
+            self.mover(dt, mundo)
+            if self.t_estado > 1.4:
+                self.eliminar = True
+            return
+
+        self.cd -= dt
+        if self.estado == 'herido':
+            self.t_estado -= dt
+            self.vx = 0
+            if self.t_estado <= 0:
+                self.estado = 'patrulla'
+        elif self.estado == 'ataque':
+            self.t_estado += dt
+            self.vx = 0
+            dur = self.cfg['dur']
+            p = self.t_estado / dur
+            if not self.disparado and 0.45 <= p <= 0.9 and jugador.vivo \
+                    and self.alcance().colliderect(jugador.rect):
+                self.disparado = True
+                self.golpe = True
+            if self.t_estado >= dur:
+                self.estado = 'patrulla'
+                self.cd = self.cfg['cd']
+        else:
+            dx = jugador.cx - self.cx
+            ve = (jugador.vivo and abs(dx) < self.cfg['rango']
+                  and abs(jugador.rect.centery - self.rect.centery) < 120)
+            if ve:
+                self.dir = signo(dx) or self.dir
+                if abs(dx) < 100:
+                    self.vx = 0
+                    if self.cd <= 0:
+                        self.estado = 'ataque'
+                        self.t_estado = 0
+                        self.disparado = False
+                else:
+                    self.vx = 0 if self._obstaculo(mundo) else self.dir * self.cfg['vel_persecucion']
+            else:
+                self.vx = self.dir * self.cfg['vel']
+                if self._obstaculo(mundo) or (self.cx - self.x0) * self.dir > self.rango_patrulla:
+                    self.dir = -self.dir
+                    self.vx = 0
+
+        self.vy = min(VEL_CAIDA_MAX, self.vy + GRAVEDAD * dt)
+        self.mover(dt, mundo)
+
+
 # ----------------------------------------------------------------------
 # Escena de juego (un nivel)
 # ----------------------------------------------------------------------
@@ -570,8 +833,14 @@ class Escena:
         self.respawn = ((c + 0.5) * TILE, (f + 1) * TILE)
         self.jugador.colocar(*self.respawn)
 
-        self.enemigos = [Enemigo(t, c, f, juego.anim_enemigos[t], self.nivel.hp_enemigos)
-                         for t, c, f in self.nivel.enemigos]
+        self.efectos = []            # efectos de las magias especiales
+        self.sacudida = 0.0          # temblor de cámara
+        self.enemigos = []
+        for t, c, f in self.nivel.enemigos:
+            cfg = TIPOS_ENEMIGO[t]
+            clase = Gorgona if cfg.get('melee') else Enemigo
+            self.enemigos.append(clase(t, c, f, juego.anim_enemigos[t],
+                                       self.nivel.hp_enemigos + cfg.get('hp_extra', 0)))
         self.items = [dict(tipo=t, x=(c + 0.5) * TILE, y=(f + 0.5) * TILE, tomado=False,
                            fase=random.random() * 6.28) for t, c, f in self.nivel.items]
         self.checks = [dict(x=(c + 0.5) * TILE, y=(f + 1) * TILE, activo=False)
@@ -585,7 +854,7 @@ class Escena:
         col = self.nivel.colores
         self.tile_cuerpo = self._tile_roca(col['roca'], col['roca_oscura'], None)
         self.tile_tope = self._tile_roca(col['roca'], col['roca_oscura'], col['borde'])
-        self.fondo = juego.fondos[self.nivel.fondo - 1]
+        self.fondo = juego.obtener_fondo(self.nivel.fondo - 1)
         self.msg_pista = 5.0
 
     @staticmethod
@@ -614,6 +883,8 @@ class Escena:
                 j.pulsar_salto()
             elif e.key in (pygame.K_j, pygame.K_z, pygame.K_x):
                 j.lanzar()
+            elif e.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                j.lanzar_especial(e.key - pygame.K_1)
             elif e.key in (pygame.K_p, pygame.K_ESCAPE):
                 self.juego.estado = 'pausa'
         elif e.type == pygame.KEYUP:
@@ -628,6 +899,9 @@ class Escena:
         teclas = pygame.key.get_pressed()
         if not self.completado:
             j.update(dt, teclas, self.mundo, self.proyectiles)
+            if j.especial_listo is not None:
+                self.crear_especial(j.especial_listo)
+                j.especial_listo = None
         else:
             j.vx = 0
             j.vy = min(VEL_CAIDA_MAX, j.vy + GRAVEDAD * dt)
@@ -642,6 +916,10 @@ class Escena:
             if (e.estado != 'muerto' and j.vivo and not self.completado
                     and j.rect.colliderect(e.rect.inflate(-6, -6))):
                 j.recibir_dano(1, e.cx, self.particulas)
+            if e.golpe:
+                e.golpe = False
+                if j.vivo and not self.completado:
+                    j.recibir_dano(1, e.cx, self.particulas)
         self.enemigos = [e for e in self.enemigos if not e.eliminar]
 
         # proyectiles
@@ -654,9 +932,7 @@ class Escena:
                     if e.estado != 'muerto' and p.rect.colliderect(e.rect):
                         p.vivo = False
                         self.particulas.explosion(p.x, p.y, p.color, 10, 200, 0.4, 4)
-                        if e.recibir_dano(p.dano, self.particulas):
-                            self.matados += 1
-                            self.juego.puntos += e.cfg['puntos']
+                        self.herir_enemigo(e, p.dano)
                         break
             else:
                 if j.vivo and not self.completado and p.rect.colliderect(j.rect):
@@ -684,6 +960,7 @@ class Escena:
                     if it['tipo'] == 'C':
                         self.cristales += 1
                         self.juego.puntos += 100
+                        j.dar_mana(MANA_CRISTAL)
                         self.particulas.explosion(it['x'], it['y'], (120, 230, 255), 10, 180, 0.4, 4)
                     else:
                         j.hp = min(VIDA_MAX, j.hp + 1)
@@ -719,6 +996,86 @@ class Escena:
         objetivo = max(0, min(self.mundo.ancho_px - ANCHO, objetivo))
         self.cam_x += (objetivo - self.cam_x) * min(1.0, 8 * dt)
         self.particulas.update(dt)
+        for ef in self.efectos:
+            ef.update(dt, self)
+        self.efectos = [ef for ef in self.efectos if ef.vivo]
+        self.sacudida = max(0.0, self.sacudida - dt)
+
+    # --- magias especiales ---------------------------------------------
+    def herir_enemigo(self, e, n):
+        """Daño a un enemigo (magia normal o especial). Gestiona puntos y magia recuperada."""
+        j = self.jugador
+        if e.estado == 'muerto':
+            return
+        j.dar_mana(1)
+        if e.recibir_dano(n, self.particulas):
+            self.matados += 1
+            self.juego.puntos += e.cfg['puntos']
+            j.dar_mana(5)
+
+    def dano_area(self, rect, n, golpeados):
+        """Daña a los enemigos que toquen 'rect' (una vez cada uno) y destruye sus proyectiles."""
+        for e in list(self.enemigos):
+            if e.estado != 'muerto' and id(e) not in golpeados and rect.colliderect(e.rect):
+                golpeados.add(id(e))
+                self.herir_enemigo(e, n)
+        self._limpiar_proyectiles(lambda p: rect.colliderect(p.rect))
+
+    def dano_circulo(self, cx, cy, radio, n):
+        for e in list(self.enemigos):
+            if e.estado == 'muerto':
+                continue
+            dx, dy = e.rect.centerx - cx, e.rect.centery - cy
+            if math.hypot(dx, dy) <= radio + 30:
+                self.herir_enemigo(e, n)
+        self._limpiar_proyectiles(lambda p: math.hypot(p.x - cx, p.y - cy) <= radio + 30)
+
+    def _limpiar_proyectiles(self, cond):
+        for p in self.proyectiles:
+            if p.dueno == 'enemigo' and p.vivo and cond(p):
+                p.vivo = False
+                self.particulas.explosion(p.x, p.y, p.color, 8, 180, 0.4, 4)
+
+    def _fila_suelo(self, col, pies_y):
+        """Fila del bloque de suelo (con aire encima) cerca de la altura 'pies_y' en la columna 'col'."""
+        fr = int(pies_y) // TILE
+        for f in range(fr - 3, fr + 5):
+            if self.mundo.solido(col, f) and not self.mundo.solido(col, f - 1):
+                return f
+        return None
+
+    def crear_especial(self, i):
+        j = self.jugador
+        fx = self.juego.fx
+        golpeados = set()                              # un golpe por enemigo en cada lanzamiento
+        if i == 0:                                     # Ola de Choque: avanza siguiendo el suelo
+            for k in range(5):
+                x = j.cx + j.dir * (85 + k * 120)
+                if x < 0 or x > self.mundo.ancho_px:
+                    break
+                col = int(x) // TILE
+                fila = self._fila_suelo(col, j.pies)
+                if fila is None or self.mundo.solido(col, fila - 1):
+                    break                              # hueco o muro: la ola se detiene
+                self.efectos.append(FxOla(fx, x, fila * TILE, k * 0.1, golpeados))
+            self.sacudida = 0.15
+        elif i == 1:                                   # Nova Arcana: explosión alrededor del mago
+            self.efectos.append(FxNova(fx, j.cx, j.y + 52))
+        else:                                          # Tormenta de Rayos: 5 rayos del cielo
+            vivos = [e for e in self.enemigos
+                     if e.estado != 'muerto' and abs(e.cx - j.cx) < ANCHO * 0.6]
+            vivos.sort(key=lambda e: abs(e.cx - j.cx))
+            objetivos = [(e.cx, e.pies) for e in vivos[:5]]
+            k = 0
+            while len(objetivos) < 5 and k < 10:      # si faltan enemigos, caen delante del mago
+                x = j.cx + j.dir * (230 + k * 170)
+                k += 1
+                if 0 <= x <= self.mundo.ancho_px:
+                    fila = self._fila_suelo(int(x) // TILE, j.pies)
+                    if fila is not None:
+                        objetivos.append((x, fila * TILE))
+            for k, (x, pies) in enumerate(objetivos):
+                self.efectos.append(FxRayo(fx, x, pies, k * 0.12, golpeados))
 
     def _tras_muerte(self):
         if self.juego.vidas <= 0:
@@ -733,6 +1090,8 @@ class Escena:
     # --- dibujo
     def dibujar(self, pantalla):
         cam = int(self.cam_x)
+        if self.sacudida > 0:
+            cam += random.randint(-1, 1) * int(2 + self.sacudida * 14)
         # fondo con parallax (tira espejada para que sea continua)
         tira = self.fondo
         ox = -(int(self.cam_x * 0.2) % tira.get_width())
@@ -765,11 +1124,10 @@ class Escena:
         self.jugador.dibujar(pantalla, cam)
         for p in self.proyectiles:
             p.dibujar(pantalla, cam)
+        for ef in self.efectos:
+            ef.dibujar(pantalla, cam)
         self.particulas.dibujar(pantalla, cam)
         self._hud(pantalla)
-
-        # Dibujar controles táctiles encima del escenario.
-        self.controles.dibujar(pantalla)
 
     @staticmethod
     def _pincho(pantalla, x, y):
@@ -825,15 +1183,58 @@ class Escena:
         # corazones
         for i in range(VIDA_MAX):
             self._corazon(pantalla, 34 + i * 38, 34, i < self.jugador.hp)
-        jg.texto(pantalla, f"Vidas x{jg.vidas}", 20, 60, jg.f_med, BLANCO)
-        jg.texto(pantalla, f"Cristales {self.cristales}/{self.total_cristales}", 20, 88, jg.f_med, (140, 230, 255))
+        self._barra_magia(pantalla)
+        self._casillas_especiales(pantalla)
+        jg.texto(pantalla, f"Vidas x{jg.vidas}", 20, 152, jg.f_med, BLANCO)
+        jg.texto(pantalla, f"Cristales {self.cristales}/{self.total_cristales}", 20, 178, jg.f_med, (140, 230, 255))
         jg.texto(pantalla, f"Puntos {jg.puntos}", ANCHO - 20, 20, jg.f_med, BLANCO, 'derecha')
         jg.texto(pantalla, self.nivel.nombre, ANCHO - 20, 48, jg.f_peq, (230, 230, 240), 'derecha')
-        jg.texto(pantalla, f"Magos {self.matados}/{self.total_enemigos}", ANCHO - 20, 72, jg.f_peq,
+        jg.texto(pantalla, f"Enemigos {self.matados}/{self.total_enemigos}", ANCHO - 20, 72, jg.f_peq,
                  (255, 190, 120), 'derecha')
         if self.msg_pista > 0 and self.nivel.pista:
             a = min(1.0, self.msg_pista)
             jg.texto(pantalla, self.nivel.pista, ANCHO // 2, ALTO - 50, jg.f_med, BLANCO, 'centro', alpha=int(255 * a))
+
+    def _barra_magia(self, pantalla):
+        """Barra de magia justo debajo de los corazones."""
+        j = self.jugador
+        x, y, w, h = 20, 58, 210, 16
+        pygame.draw.rect(pantalla, (20, 18, 36), (x - 2, y - 2, w + 4, h + 4), border_radius=5)
+        if j.mana_vis > 0:                                    # parte que se está gastando
+            pygame.draw.rect(pantalla, (235, 240, 255), (x, y, int(w * j.mana_vis / MANA_MAX), h), border_radius=4)
+        if j.mana > 0:
+            pygame.draw.rect(pantalla, (70, 130, 255), (x, y, int(w * j.mana / MANA_MAX), h), border_radius=4)
+            pygame.draw.rect(pantalla, (140, 190, 255), (x, y, int(w * j.mana / MANA_MAX), h // 3), border_radius=4)
+        borde = (255, 90, 90) if (j.sin_mana > 0 and int(j.sin_mana * 16) % 2 == 0) else (170, 180, 220)
+        pygame.draw.rect(pantalla, borde, (x - 2, y - 2, w + 4, h + 4), 2, border_radius=5)
+        self.juego.texto(pantalla, f"MAGIA {int(j.mana)}", x + 6, y + 1, self.juego.f_peq, BLANCO, sombra=True)
+
+    def _casillas_especiales(self, pantalla):
+        """Teclas 1-3 con su icono, coste de magia y enfriamiento."""
+        jg, j = self.juego, self.jugador
+        tam = 54
+        for i, esp in enumerate(ESPECIALES):
+            x, y = 20 + i * (tam + 10), 84
+            falta_mana = j.mana < esp['coste']
+            pygame.draw.rect(pantalla, (24, 22, 44), (x, y, tam, tam), border_radius=6)
+            ic = jg.iconos[i]
+            pantalla.blit(ic, (x + (tam - ic.get_width()) // 2, y + (tam - ic.get_height()) // 2))
+            cd = j.cd_esp[i]
+            if cd > 0:
+                alto = int(tam * cd / esp['cd'])
+                velo = pygame.Surface((tam, alto), pygame.SRCALPHA)
+                velo.fill((0, 0, 0, 185))
+                pantalla.blit(velo, (x, y))
+                jg.texto(pantalla, f"{cd:.1f}", x + tam // 2, y + 18, jg.f_med, BLANCO, 'centro')
+            elif falta_mana:
+                velo = pygame.Surface((tam, tam), pygame.SRCALPHA)
+                velo.fill((40, 40, 70, 150))
+                pantalla.blit(velo, (x, y))
+            lista = cd <= 0 and not falta_mana
+            pygame.draw.rect(pantalla, (255, 230, 120) if lista else (110, 110, 140), (x, y, tam, tam), 2,
+                             border_radius=6)
+            jg.texto(pantalla, str(i + 1), x + 5, y + 3, jg.f_peq, (255, 230, 120))
+            jg.texto(pantalla, str(esp['coste']), x + tam - 5, y + tam - 20, jg.f_peq, (140, 190, 255), 'derecha')
 
     @staticmethod
     def _corazon(pantalla, x, y, lleno):
@@ -850,34 +1251,35 @@ class Juego:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Magos - Etapa 1")
-        try:
-            self.pantalla = pygame.display.set_mode((ANCHO, ALTO), pygame.SCALED | pygame.RESIZABLE)
-        except pygame.error:
-            self.pantalla = pygame.display.set_mode((ANCHO, ALTO))
+        if WEB:
+            self.pantalla = pygame.display.set_mode((ANCHO, ALTO))     # el navegador escala el lienzo
+        else:
+            try:
+                self.pantalla = pygame.display.set_mode((ANCHO, ALTO), pygame.SCALED | pygame.RESIZABLE)
+            except pygame.error:
+                self.pantalla = pygame.display.set_mode((ANCHO, ALTO))
         self.reloj = pygame.time.Clock()
         self.f_gran = pygame.font.Font(None, 96)
         self.f_med = pygame.font.Font(None, 32)
         self.f_peq = pygame.font.Font(None, 26)
         self.f_tit = pygame.font.Font(None, 56)
 
-        # fondos: se crean tiras espejadas (2x ancho) para el scroll continuo
-        self.fondos = []
-        for i in range(1, 5):
-            img = pygame.image.load(os.path.join(RUTA_FONDOS, f"fondo_{i}.png")).convert()
-            tira = pygame.Surface((ANCHO * 2, ALTO))
-            tira.blit(img, (0, 0))
-            tira.blit(pygame.transform.flip(img, True, False), (ANCHO, 0))
-            self.fondos.append(tira)
+        # fondos: se cargan bajo demanda (solo el que se usa) para ahorrar memoria, sobre todo en web
+        self._fondo_i = -1
+        self._fondo_tira = None
 
-        self.anim_jugador = cargar_personaje("Wanderer Magican", {
+        self.anim_jugador = cargar_personaje("Wanderer_Magican", {
             'idle': ("Idle.png", 8), 'walk': ("Walk.png", 11), 'run': ("Run.png", 14),
-            'jump': ("Jump.png", 10), 'attack': ("Attack_1.png", 20),
+            'jump': ("Jump.png", 10), 'attack': ("Attack_1.png", 20), 'cast': ("Attack_2.png", 18),
             'hurt': ("Hurt.png", 10), 'dead': ("Dead.png", 6)})
         self.anim_enemigos = {}
         for t, cfg in TIPOS_ENEMIGO.items():
-            self.anim_enemigos[t] = cargar_personaje(cfg['carpeta'], {
-                'idle': ("Idle.png", 8), 'walk': ("Walk.png", 9), 'attack': ("Attack_1.png", 10),
-                'hurt': ("Hurt.png", 10), 'dead': ("Dead.png", 8)})
+            self.anim_enemigos[t] = cargar_personaje(cfg['carpeta'], cfg['anims'], cfg.get('ancla', ANCLA_X))
+
+        # efectos de magias especiales e iconos de la barra de habilidades
+        self.fx = cargar_efectos()
+        self.iconos = [self._icono(self.fx['ola'][6]), self._icono(self.fx['nova'][5]),
+                       self._icono(self.fx['rayo_b'][2])]
 
         self.estado = 'menu'
         self.nivel_sel = 0
@@ -887,6 +1289,22 @@ class Juego:
         self.t_menu = 0.0
 
     # --- utilidades
+    def obtener_fondo(self, i):
+        """Devuelve el fondo i (0-7) como tira espejada de 2x ancho (scroll continuo). Conserva solo el último."""
+        if self._fondo_i != i:
+            img = pygame.image.load(os.path.join(RUTA_FONDOS, f"fondo_{i + 1}.png")).convert()
+            tira = pygame.Surface((ANCHO * 2, ALTO))
+            tira.blit(img, (0, 0))
+            tira.blit(pygame.transform.flip(img, True, False), (ANCHO, 0))
+            self._fondo_tira, self._fondo_i = tira, i
+        return self._fondo_tira
+
+    @staticmethod
+    def _icono(img, tam=46):
+        """Reduce un cuadro de efecto a un icono cuadrado manteniendo la proporción."""
+        k = min(tam / img.get_width(), tam / img.get_height())
+        return pygame.transform.smoothscale(img, (max(1, int(img.get_width() * k)), max(1, int(img.get_height() * k))))
+
     def texto(self, pantalla, txt, x, y, fuente, color, alin='izq', alpha=255, sombra=True):
         if sombra:
             s = fuente.render(txt, True, (0, 0, 0))
@@ -919,7 +1337,9 @@ class Juego:
         self.estado = 'jugando'
 
     # --- bucle
-    def ejecutar(self):
+    async def ejecutar(self):
+        # 'await asyncio.sleep(0)' cede el control al navegador en cada cuadro (obligatorio en Pygbag;
+        # en escritorio no tiene ningún efecto negativo).
         while True:
             dt = min(self.reloj.tick(FPS) / 1000.0, 1 / 30)
             for e in pygame.event.get():
@@ -930,98 +1350,41 @@ class Juego:
             self.update(dt)
             self.dibujar()
             pygame.display.flip()
+            await asyncio.sleep(0)
 
     def evento(self, e):
-
-        es_teclado = e.type in (
-            pygame.KEYDOWN,
-            pygame.KEYUP
-        )
-
-        es_tactil = e.type in (
-            pygame.FINGERDOWN,
-            pygame.FINGERMOTION,
-            pygame.FINGERUP
-        )
-
-        if not es_teclado and not es_tactil:
+        if e.type != pygame.KEYDOWN and e.type != pygame.KEYUP:
             return
-
-        if self.estado == 'menu':
-
-            if e.type == pygame.KEYDOWN:
-
-                if e.key in (pygame.K_LEFT, pygame.K_a):
-                    self.nivel_sel = (
-                                             self.nivel_sel - 1
-                                     ) % len(niveles.NIVELES)
-
-                elif e.key in (pygame.K_RIGHT, pygame.K_d):
-                    self.nivel_sel = (
-                                             self.nivel_sel + 1
-                                     ) % len(niveles.NIVELES)
-
-                elif pygame.K_1 <= e.key <= pygame.K_4:
-                    self.nivel_sel = e.key - pygame.K_1
-
-                elif e.key in (
-                        pygame.K_RETURN,
-                        pygame.K_KP_ENTER,
-                        pygame.K_SPACE
-                ):
-                    self.nueva_partida(self.nivel_sel)
-
-                elif e.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    sys.exit()
-
+        if self.estado == 'menu' and e.type == pygame.KEYDOWN:
+            if e.key in (pygame.K_LEFT, pygame.K_a):
+                self.nivel_sel = (self.nivel_sel - 1) % len(niveles.NIVELES)
+            elif e.key in (pygame.K_RIGHT, pygame.K_d):
+                self.nivel_sel = (self.nivel_sel + 1) % len(niveles.NIVELES)
+            elif pygame.K_1 <= e.key <= pygame.K_8:
+                self.nivel_sel = e.key - pygame.K_1
+            elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self.nueva_partida(self.nivel_sel)
+            elif e.key == pygame.K_ESCAPE and not WEB:       # en el navegador no se "sale"
+                pygame.quit()
+                sys.exit()
         elif self.estado == 'jugando':
-
             self.escena.evento(e)
-
-        elif self.estado == 'pausa':
-
-            if e.type == pygame.KEYDOWN:
-
-                if e.key in (
-                        pygame.K_p,
-                        pygame.K_ESCAPE,
-                        pygame.K_RETURN
-                ):
+        elif self.estado == 'pausa' and e.type == pygame.KEYDOWN:
+            if e.key in (pygame.K_p, pygame.K_ESCAPE, pygame.K_RETURN):
+                self.estado = 'jugando'
+            elif e.key == pygame.K_m:
+                self.estado = 'menu'
+        elif self.estado == 'nivel_completo' and e.type == pygame.KEYDOWN:
+            if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                sig = self.escena.indice + 1
+                if sig >= len(niveles.NIVELES):
+                    self.estado = 'victoria'
+                else:
+                    self.escena = Escena(self, sig)
                     self.estado = 'jugando'
-
-                elif e.key == pygame.K_m:
-                    self.estado = 'menu'
-
-        elif self.estado == 'nivel_completo':
-
-            if e.type == pygame.KEYDOWN:
-
-                if e.key in (
-                        pygame.K_RETURN,
-                        pygame.K_KP_ENTER,
-                        pygame.K_SPACE
-                ):
-
-                    sig = self.escena.indice + 1
-
-                    if sig >= len(niveles.NIVELES):
-                        self.estado = 'victoria'
-
-                    else:
-                        self.escena = Escena(self, sig)
-                        self.estado = 'jugando'
-
-        elif self.estado in ('game_over', 'victoria'):
-
-            if e.type == pygame.KEYDOWN:
-
-                if e.key in (
-                        pygame.K_RETURN,
-                        pygame.K_KP_ENTER,
-                        pygame.K_SPACE
-                ):
-                    self.estado = 'menu'
+        elif self.estado in ('game_over', 'victoria') and e.type == pygame.KEYDOWN:
+            if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                self.estado = 'menu'
 
     def update(self, dt):
         self.t_menu += dt
@@ -1047,7 +1410,7 @@ class Juego:
             self.texto(p, "NIVEL COMPLETADO", ANCHO // 2, 190, self.f_gran, (255, 230, 120), 'centro')
             self.texto(p, e.nivel.nombre, ANCHO // 2, 270, self.f_tit, BLANCO, 'centro')
             self.texto(p, f"Cristales: {e.cristales}/{e.total_cristales}", ANCHO // 2, 340, self.f_med, (140, 230, 255), 'centro')
-            self.texto(p, f"Magos derrotados: {e.matados}/{e.total_enemigos}", ANCHO // 2, 375, self.f_med, (255, 190, 120), 'centro')
+            self.texto(p, f"Enemigos derrotados: {e.matados}/{e.total_enemigos}", ANCHO // 2, 375, self.f_med, (255, 190, 120), 'centro')
             self.texto(p, f"Puntos: {self.puntos}", ANCHO // 2, 410, self.f_med, BLANCO, 'centro')
             self.texto(p, "ENTER para continuar", ANCHO // 2, 490, self.f_med, (220, 220, 230), 'centro')
         elif self.estado == 'game_over':
@@ -1063,7 +1426,7 @@ class Juego:
             self.texto(p, "ENTER para volver al menu", ANCHO // 2, 450, self.f_med, (220, 220, 230), 'centro')
 
     def _menu(self, p):
-        fondo = self.fondos[self.nivel_sel]
+        fondo = self.obtener_fondo(niveles.NIVELES[self.nivel_sel]().fondo - 1)
         ox = -int(self.t_menu * 25) % fondo.get_width()
         p.blit(fondo, (-ox, 0))
         p.blit(fondo, (fondo.get_width() - ox, 0))
@@ -1076,11 +1439,15 @@ class Juego:
         # selector de nivel
         nombre = niveles.NIVELES[self.nivel_sel]().nombre
         self.texto(p, "<   " + nombre + "   >", ANCHO // 2, 545, self.f_tit, BLANCO, 'centro')
-        self.texto(p, "ENTER: jugar     A/D o flechas (o 1-4): elegir nivel     ESC: salir",
+        self.texto(p, "ENTER: jugar     A/D o flechas (o 1-8): elegir nivel" + ("" if WEB else "     ESC: salir"),
                    ANCHO // 2, 610, self.f_peq, (230, 230, 240), 'centro')
-        self.texto(p, "Mover: A/D  |  Saltar: ESPACIO  |  Correr: SHIFT  |  Magia: J", ANCHO // 2, 640,
+        self.texto(p, "Mover: A/D  |  Saltar: ESPACIO  |  Correr: SHIFT  |  Magia: J  |  Especiales: 1, 2, 3", ANCHO // 2, 640,
                    self.f_peq, (230, 230, 240), 'centro')
 
 
+async def main():
+    await Juego().ejecutar()
+
+
 if __name__ == "__main__":
-    Juego().ejecutar()
+    asyncio.run(main())
